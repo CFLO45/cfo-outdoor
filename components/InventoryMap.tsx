@@ -42,18 +42,26 @@ export default function InventoryMap() {
   const [userPin, setUserPin] = useState<{ lat: number; lng: number } | null>(null);
   const [boardSearch, setBoardSearch] = useState("");
 
-  function handleBoardSearch() {
-    if (!boardSearch.trim()) return;
-    const match = boards.find(
-      (b) => b.board_number.toLowerCase() === boardSearch.trim().toLowerCase()
-    );
-    if (match) {
-      setActive(match);
-      mapRef.current?.flyTo({
-        center: [match.longitude, match.latitude],
-        zoom: 14,
-        duration: 800,
-      });
+  async function handleBoardSearch() {
+    const query = boardSearch.trim();
+    if (!query) return;
+    // Looked up directly against the database rather than the currently-loaded boards —
+    // with viewport-based loading, the board being searched for may not be in view yet.
+    try {
+      const res = await fetch(`/api/boards?boardNumber=${encodeURIComponent(query)}`);
+      const data: Board[] = await res.json();
+      const match = data[0];
+      if (match) {
+        setBoards((prev) => (prev.some((b) => b.id === match.id) ? prev : [...prev, ...data]));
+        setActive(match);
+        mapRef.current?.flyTo({
+          center: [match.longitude, match.latitude],
+          zoom: 14,
+          duration: 800,
+        });
+      }
+    } catch {
+      // matches prior behavior — a failed/no-match search just does nothing
     }
   }
 
@@ -82,13 +90,60 @@ export default function InventoryMap() {
     }
   }
 
-  useEffect(() => {
-    fetch("/api/boards")
-      .then((r) => r.json())
-      .then(setBoards)
-      .catch(() => setBoards([]))
-      .finally(() => setLoading(false));
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const fetchBoards = useCallback(async (params?: URLSearchParams) => {
+    setLoading(true);
+    try {
+      const query = params && params.toString() ? `?${params.toString()}` : "";
+      const res = await fetch(`/api/boards${query}`);
+      const data = await res.json();
+      setBoards(data);
+    } catch {
+      setBoards([]);
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  // Fetches boards for whatever's relevant right now: the current map viewport by default,
+  // or the full dataset when a county/city filter is active (we don't have per-county bounding
+  // boxes to auto-fit the map, so filtered views fall back to fetching everything and filtering
+  // client-side, same as before viewport loading existed).
+  const fetchForCurrentView = useCallback(() => {
+    if (countyFilter !== "all" || cityFilter !== "all") {
+      fetchBoards();
+      return;
+    }
+    const map = mapRef.current?.getMap();
+    if (!map) return;
+    const bounds = map.getBounds();
+    const params = new URLSearchParams({
+      minLat: bounds.getSouth().toString(),
+      maxLat: bounds.getNorth().toString(),
+      minLng: bounds.getWest().toString(),
+      maxLng: bounds.getEast().toString(),
+    });
+    fetchBoards(params);
+  }, [countyFilter, cityFilter, fetchBoards]);
+
+  const debouncedFetchForCurrentView = useCallback(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(fetchForCurrentView, 300);
+  }, [fetchForCurrentView]);
+
+  useEffect(() => {
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, []);
+
+  // Re-fetch immediately (no debounce) whenever the county/city filter changes, since that
+  // switches between viewport-bound and full-dataset fetching.
+  useEffect(() => {
+    fetchForCurrentView();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [countyFilter, cityFilter]);
 
   const filtered = useMemo(() => {
     const cityObj = cities.find((c) => c.slug === cityFilter);
@@ -207,6 +262,8 @@ export default function InventoryMap() {
             initialViewState={{ longitude: -81.6, latitude: 28.3, zoom: 8 }}
             style={{ width: "100%", height: "100%" }}
             mapStyle="mapbox://styles/mapbox/light-v11"
+            onLoad={fetchForCurrentView}
+            onMoveEnd={debouncedFetchForCurrentView}
           >
             {userPin && (
               <Marker longitude={userPin.lng} latitude={userPin.lat}>
